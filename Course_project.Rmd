@@ -280,11 +280,6 @@ percentages
 
 ```
 
-Can you use two-way ANOVA to answer the above question more rigorously? 
-
-
-
-
 ### Visualize success rate change over time (trial)
 The success rate is binned for each 25 trials.
 ```{r, echo = FALSE}
