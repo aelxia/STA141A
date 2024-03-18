@@ -1,0 +1,689 @@
+---
+title: "STA 141A Course Project: Predictive Model Selection for Neural Activity"
+author: "Alexia Huang 920094002"
+date: "03-18-2024"
+output: html_document
+---
+
+# Question of interest
+
+The primary objective of this project is to build a predictive model to predict the outcome (i.e., feedback type) of each trial using the neural activity data (i.e., spike trains in `spks`), along with the stimuli (the left and right contrasts). Given the complexity of the data (and that this is a course project), we break the predictive modeling into three parts as follows. 
+
+Part 1. Exploratory data analysis. In this part, we will explore the features of the data sets in order to build our prediction model. In particular, we would like to (i) describe the data structures across sessions (e.g., number of neurons, number of trials, stimuli conditions, feedback types), (ii) explore the neural activities during each trial, (iii) explore the changes across trials, and (iv) explore homogeneity and heterogeneity across sessions and mice.
+
+Part 2. Data integration. Using the findings in Part 1, we will propose an approach to combine data across trials by (i) extracting the shared patters across sessions and/or (ii) addressing the differences between sessions. The goal of this part is to enable the borrowing of information across sessions to enhance the prediction performance in Part 3.
+
+Part 3. Model training and prediction. Finally, we will build a prediction model to predict the outcome (i.e., feedback types). The performance will be evaluated on two test sets of 100 trials randomly selected from Session 1 and Session 18, respectively. The test sets will be released on the day of submission when you need to evaluate the performance of your model.
+
+# Abstract
+
+This course project uses a subset of data from the Steinmetz et al. (2019) paper. We explore any trends noted when looking at neural activity (spikes) in the data. Then, we integrate the data and build a predictive model in order to test on sessions 1 and 18 in the test data.
+
+
+# (1) Introduction
+
+This course project looks at data from Steinmetz et al. (2019) and specifically examines the spike trains of neurons from the onset of the stimuli to 0.4 second after. 18 sessions (Sessions 1 to 18) from four mice: Cori, Frossman, Hence, and Lederberg are used.
+
+The goal of this project is to build a predictive model to predict the outcome of each trial. This is done by examining the neural activity data which is denoted by the variable `spks`. We are also looking at the left and right contrasts which serve as the stimuli. The three main steps of the project are exploring the data, integrating the data, and building the model. We will then test the performance of the model on the test data provided which cover sessions 1 and 18. 
+
+# (2) Exploratory Data Analysis
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(eval = TRUE, echo = TRUE, fig.align='center')
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(tidyverse)
+library(caret) 
+library(xgboost)
+library(pROC)
+```
+
+```{r sessions, echo = FALSE, eval = TRUE}
+
+session=list()
+for(i in 1:18){
+  session[[i]]=readRDS(paste('./Data/session',i,'.rds',sep=''))
+  print(session[[i]]$mouse_name)
+  print(session[[i]]$date_exp)
+  
+}
+length(session[[1]]$spks)
+
+```
+## What's in a session?  
+```{r, echo = FALSE}
+names(session[[1]])
+```
+## What's in a trial?
+```{r trial}
+dim(session[[1]]$spks[[1]]) 
+length(session[[1]]$brain_area)
+session[[1]]$spks[[1]][6,] # Each row contains 40 time bins. 
+```
+This indicates where 0 is no spike and 1 is a spike. There are 40 time bins in each trial.
+## Neuron spike plus the brain region
+```{r data}
+session[[1]]$spks[[1]][5,7] 
+session[[1]]$brain_area[5]
+```
+
+From this we can see that in session 1, trial 1, the 5th neuron from the area MOs does not have a spike at the time bin 7.
+
+## Data processing
+```{r, echo = FALSE}
+get_trial_data <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  #trial_tibble <- as_tibble(spikes) %>% set_names(binename) %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( "sum_spikes" =across(everything(),sum),.groups = "drop") 
+  trial_tibble <- tibble("neuron_spike" = rowSums(spikes))  %>%  add_column("brain_area" = session[[session_id]]$brain_area ) %>% group_by(brain_area) %>% summarize( region_sum_spike = sum(neuron_spike), region_count = n(),region_mean_spike = mean(neuron_spike)) 
+  trial_tibble  = trial_tibble%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trial_id])
+  trial_tibble
+}
+
+```
+
+```{r,echo=FALSE}
+
+get_session_data <- function(session_id){
+  n_trial <- length(session[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_data(session_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  session_tibble <- do.call(rbind, trial_list)
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+```{r, echo = FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_data(session_id)
+}
+full_tibble <- do.call(rbind, session_list)
+full_tibble$success <- full_tibble$feedback_type == 1
+full_tibble$success <- as.numeric(full_tibble$success)
+full_tibble$contrast_diff <- abs(full_tibble$contrast_left-full_tibble$contrast_right)
+
+```
+
+```{r, echo = FALSE}
+bin_name <- paste0("bin", as.character(1:40))
+
+get_trial_functional_data <- function(session_id, trial_id){
+  spikes <- session[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trial_bin_average) <- bin_name
+  trial_tibble  = as_tibble(trial_bin_average)%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= session[[session_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= session[[session_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= session[[session_id]]$feedback_type[trial_id])
+  
+  trial_tibble
+}
+get_session_functional_data <- function(session_id){
+  n_trial <- length(session[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_functional_data(session_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  session_tibble <- as_tibble(do.call(rbind, trial_list))
+  session_tibble <- session_tibble %>% add_column("mouse_name" = session[[session_id]]$mouse_name) %>% add_column("date_exp" = session[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  session_tibble
+}
+
+```
+
+```{r, echo = FALSE}
+session_list = list()
+for (session_id in 1: 18){
+  session_list[[session_id]] <- get_session_functional_data(session_id)
+}
+full_functional_tibble <- as_tibble(do.call(rbind, session_list))
+full_functional_tibble$session_id <- as.factor(full_functional_tibble$session_id )
+full_functional_tibble$contrast_diff <- abs(full_functional_tibble$contrast_left-full_functional_tibble$contrast_right)
+
+full_functional_tibble$success <- full_functional_tibble$feedback_type == 1
+full_functional_tibble$success <- as.numeric(full_functional_tibble$success)
+```
+
+This table below shows each trial. Each column shows the average spike rate within each time bin.
+
+```{r, echo = FALSE}
+head(full_functional_tibble)
+```
+
+
+# EDA
+Looking at differences between sessions and mouses.
+## What is different for each session/mouse?
+### What are the number of neuron's in each session?
+```{r, echo = FALSE}
+num_neurons <- full_tibble %>% filter (trial_id==1) %>% group_by(session_id) %>% summarise(sum(region_count))
+print(num_neurons)
+library(dplyr)
+
+# Filter the data to include only rows where trial_id is equal to 1
+filtered_data <- full_tibble %>% filter(trial_id == 1)
+
+# Calculate the total number of neurons across all sessions
+total_neurons <- filtered_data %>% 
+  summarise(total_neurons = sum(region_count))
+
+# Print the total number of neurons
+print(total_neurons)
+
+```
+### What is the number brain area of each session?
+```{r, echo = FALSE}
+num_brain_area <- full_tibble %>% group_by(session_id) %>% summarise(unique_area = n_distinct(brain_area))
+(num_brain_area)
+```
+
+### What is the average spike rate over each session?
+This is calculated using the average of neurons spikes over each time bin (onset to 0.4 post-onset).
+```{r, echo = FALSE}
+average_spike <- full_tibble %>% group_by( session_id, trial_id) %>% mutate(mean_spike = sum(region_sum_spike)/sum(region_count))
+average_spike %>% group_by(session_id) %>% summarise(mean_session_spike = mean(mean_spike))
+```
+
+### What are the brain areas with neurons recorded in each session?
+
+```{r, echo = FALSE}
+ggplot(full_tibble, aes(x =session_id , y = brain_area)) +
+  geom_point() +
+  labs(x = "session_id" , y ="brain_area") +
+  scale_x_continuous(breaks = unique(full_tibble$session_id)) +  
+  theme_minimal()
+```
+```{r, echo = FALSE}
+library(dplyr)
+library(ggplot2)
+
+# Assuming you have num_neurons calculated
+num_neurons <- full_tibble %>% 
+  filter(trial_id == 1) %>% 
+  group_by(session_id) %>% 
+  summarise(num_neurons = sum(region_count))
+
+# Calculate percentage
+eda1 <- num_neurons %>%
+  mutate(perc = num_neurons / sum(num_neurons)) %>%
+  arrange(perc) %>%
+  mutate(labels = scales::percent(perc))
+eda1
+# Plot
+ggplot(eda1, aes(x = "", y = perc, fill = session_id)) + 
+  geom_col() + 
+  geom_text(aes(label = labels), position = position_stack(vjust = 0.4), size = 2) + 
+  coord_polar(theta = "y")
+
+```
+The plot above looks at the percentage of neurons in each session. For example, session 4 has the highest amount of neurons as indicated by its percentage of 10.849% - the highest proportion across the total number of neurons across all sessions.
+### Estimate success rate over different groups (session and mouse)
+```{r, echo = FALSE}
+eda1 = num_neurons %>% group_by(session_id) %>% count() %>% 
+  ungroup() %>% 
+  mutate(perc = `n` / sum(`n`)) %>% 
+  arrange(perc) %>%
+  mutate(labels = scales::percent(perc))
+
+eda1
+
+ggplot(eda1, aes(x = "", y = perc, fill = session_id)) + 
+    geom_col() + 
+    geom_text(aes(label = labels), position = position_stack(vjust = 0.4), size = 2) + 
+    coord_polar(theta = "y")
+```
+
+```{r, echo = FALSE}
+full_functional_tibble %>% group_by(session_id) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+```
+```{r, echo = FALSE}
+full_functional_tibble %>% group_by(mouse_name) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+```
+
+## What is different among each trial?
+
+### What is the contrast difference distribution?
+```{r, echo = FALSE}
+full_functional_tibble %>% group_by(contrast_diff) %>% count() %>% 
+  ungroup() %>% 
+  mutate(perc = `n` / sum(`n`)) %>% 
+  arrange(perc) %>%
+  mutate(labels = scales::percent(perc))
+```
+
+### How does the contrast difference affect the success rate?
+```{r, echo = FALSE}
+full_functional_tibble %>% group_by(contrast_diff) %>% summarize(success_rate = mean(success, na.rm = TRUE))
+```
+
+### Does the success rate difference among mice caused by the different distributions of contrast difference? 
+
+```{r, echo = FALSE}
+counts_df <- full_functional_tibble[c('mouse_name', 'contrast_diff')]
+counts_df$contrast_diff <- as.factor(counts_df$contrast_diff)
+counts <- table(counts_df)
+
+percentages <- prop.table(counts, margin = 1)
+percentages
+
+```
+
+Can you use two-way ANOVA to answer the above question more rigorously? 
+
+
+
+
+### Visualize success rate change over time (trial)
+The success rate is binned for each 25 trials.
+```{r, echo = FALSE}
+full_functional_tibble$trial_group = cut(full_functional_tibble$trial_id, breaks = seq(0, max(full_functional_tibble$trial_id), by = 25),include.lowest = TRUE)
+levels(full_functional_tibble$trial_group) <- seq(0, max(full_functional_tibble$trial_id), by = 25)[2:18]
+```
+
+The success rate change over time for individual sessions:
+
+```{r, echo = FALSE}
+success_rate <- aggregate(success ~ session_id + trial_group, data = full_functional_tibble, FUN = function(x) mean(x) )
+ggplot(success_rate, aes(x = trial_group, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~session_id, ncol=3) +
+      theme_bw()
+
+```
+
+The success rate change over time for individual mouse:
+
+```{r, echo = FALSE}
+success_rate <- aggregate(success ~ mouse_name + trial_group, data = full_functional_tibble, FUN = function(x) mean(x) )
+ggplot(success_rate, aes(x = trial_group, y = success)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~mouse_name) +
+      theme_bw()
+```
+
+
+### Visualize the change of overall neuron spike rate over time
+
+The ``average_spike`` is the number of spikes within each number bin divided total number of neurons for each trial.
+
+```{r, echo = FALSE}
+col_names <-names(full_functional_tibble)
+region_sum_subset <- col_names[grep("^region_sum", col_names)]
+region_mean_subset <- col_names[grep("^region_mean", col_names)]
+
+```
+```{r, echo = FALSE}
+# average_spike <- full_tibble %>% group_by( session_id,trial_id) %>% summarise(mean_spike = mean(region_mean_spike))
+average_spike <- full_tibble %>% group_by( session_id,trial_id) %>% summarise(mean_spike = sum(region_sum_spike)/sum(region_count), .groups = "keep")
+
+average_spike$mouse_name <- full_functional_tibble$mouse_name
+average_spike$contrast_diff <- full_functional_tibble$contrast_diff
+average_spike$success <- full_functional_tibble$success
+```
+
+The change of overall neuron spike rate for each session 
+
+```{r, echo = FALSE}
+ggplot(average_spike, aes(x = trial_id, y = mean_spike)) + 
+  geom_line()+
+  geom_smooth(method = "loess")+  # Fit a smooth spline
+
+  facet_wrap(~session_id)
+```
+
+The change of overall neuron spike rate for each mouse 
+
+```{r, echo = FALSE}
+ggplot(average_spike, aes(x = trial_id, y = mean_spike)) + 
+  geom_line()+
+  geom_smooth(method = "loess")+  # Fit a smooth spline
+
+  facet_wrap(~mouse_name)
+```
+
+# Dimension Reduction through PCA
+
+Performing PCA and plotting these on the sessions, we can look at correlation between variables.
+
+```{r, echo = FALSE}
+features = full_functional_tibble[,1:40]
+scaled_features <- scale(features)
+pca_result <- prcomp(scaled_features)
+pc_df <- as.data.frame(pca_result$x)
+pc_df$session_id <- full_functional_tibble$session_id
+pc_df$mouse_name <- full_functional_tibble$mouse_name
+```
+
+These are grouped by each session.
+
+```{r, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = session_id)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+```
+
+These are grouped by each mouse.
+```{r, echo = FALSE}
+ggplot(pc_df, aes(x = PC1, y = PC2, color = mouse_name)) +
+  geom_point() +
+  labs(title = "PCA: PC1 vs PC2")
+```
+
+From these two plots, we can see a lot of overlap and possible correlation in the variables in the data.
+
+# (3) Data Integration
+First, analyze all sessions without singling out sessions 1 and 18 (though they will be the sessions of interest later on). The variables examined are session_id, trial_id, signals, and the spike rate of each time bin on average.
+
+First, examining the proportion of active neurons in each session (1.581744). Then looking at the average number of spikes per active neuron (0.4155313). Lastly, looking at the average number of spikes per neuron (3.806557). Plotting each session against firing rates, we can see there is great variability in the firing rates.
+```{r, echo = FALSE}
+spks.trial=session[[1]]$spks[[1]]
+total.spikes=apply(spks.trial,1,sum)
+(avg.spikes=mean(total.spikes))
+
+mean(total.spikes>0)
+mean(total.spikes[total.spikes>0])
+firing.rate=apply(spks.trial,2,mean)
+plot(firing.rate, type = "l")
+```
+
+```{r, echo = FALSE}
+predictive_feature <- c("session_id","trial_id","contrast_right","contrast_left", "contrast_diff" ,bin_name)
+head(full_functional_tibble[predictive_feature])
+```
+The table above shows the predictive features we are using (session_id, trial_id, etc.) for each time bin.
+```{r, echo = FALSE}
+predictive_data <- full_functional_tibble[predictive_feature]
+#predictive_data$success <- as.numeric(predictive_data$success)
+predictive_data$trial_id <- as.numeric(predictive_data$trial_id)
+label <- as.numeric(full_functional_tibble$success)
+X <- model.matrix(~., predictive_data)
+```
+
+# (3) Model Training and Prediction
+## Retaining 80% of the data to train the prediction model
+Leaving out 20% of the data to test the prediction model, examine the performance based on the 80% of data retained for model training.
+```{r, echo = FALSE}
+# split
+set.seed(123) # for reproducibility
+trainIndex <- createDataPartition(label, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_df <- predictive_data[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+# Predictive modeling
+Using xgboost to build a prediction model, I hope to capture interactions among the variables without overfitting/overestimating the prediction.
+```{r, echo = FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+
+```
+
+Prediction results. This measures accuracy using a confusion matrix and AUROC.
+```{r, echo = FALSE}
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+
+```
+
+## Session 1, randomized trials (n = 50).
+```{r, echo = FALSE}
+# split
+set.seed(123) # for reproducibility
+session_1_row <- which(full_functional_tibble$session_id==1)
+testIndex <- sample(session_1_row, 50, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_data[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+Prediction results. This measures accuracy using a confusion matrix and AUROC.
+
+```{r, echo = FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+## Session 18, randomized trials (n = 50).
+```{r, echo = FALSE}
+# split
+set.seed(123) # for reproducibility
+session_18_row <- which(full_functional_tibble$session_id==18)
+testIndex <- sample(session_18_row, 50, replace = FALSE)
+trainIndex <- 1:nrow(full_functional_tibble)
+trainIndex <- trainIndex[!(trainIndex %in% testIndex)]
+
+train_df <- predictive_data[trainIndex, ]
+train_X <- X[trainIndex,]
+test_df <- predictive_data[-trainIndex, ]
+test_X <- X[-trainIndex,]
+
+train_label <- label[trainIndex]
+test_label <- label[-trainIndex]
+```
+
+Prediction results. This measures accuracy using a confusion matrix and AUROC.
+
+```{r, echo = FALSE}
+xgb_model <- xgboost(data = train_X, label = train_label, objective = "binary:logistic", nrounds=10)
+predictions <- predict(xgb_model, newdata = test_X)
+predicted_labels <- as.numeric(ifelse(predictions > 0.5, 1, 0))
+accuracy <- mean(predicted_labels == test_label)
+accuracy
+conf_matrix <- confusionMatrix(as.factor(predicted_labels), as.factor(test_label))
+conf_matrix$table
+auroc <- roc(test_label, predictions)
+auroc
+```
+# (5) Prediction performance on the test sets
+## Data processing on test sets
+```{r test data, echo = FALSE}
+test=list()
+for(i in 1:2){
+  test[[i]]=readRDS(paste('./Data/test',i,'.rds',sep=''))
+  print(test[[i]]$mouse_name)
+  print(test[[i]]$date_exp)
+  
+}
+
+bin_name <- paste0("bin", as.character(1:40))
+
+get_trial_functional_data <- function(session_id, trial_id){
+  spikes <- test[[session_id]]$spks[[trial_id]]
+  if (any(is.na(spikes))){
+    disp("value missing")
+  }
+
+  trial_bin_average <- matrix(colMeans(spikes), nrow = 1)
+  colnames(trial_bin_average) <- bin_name
+  trial_tibble  = as_tibble(trial_bin_average)%>% add_column("trial_id" = trial_id) %>% add_column("contrast_left"= test[[session_id]]$contrast_left[trial_id]) %>% add_column("contrast_right"= test[[session_id]]$contrast_right[trial_id]) %>% add_column("feedback_type"= test[[session_id]]$feedback_type[trial_id])
+  
+  trial_tibble
+}
+get_test_functional_data <- function(session_id){
+  n_trial <- length(test[[session_id]]$spks)
+  trial_list <- list()
+  for (trial_id in 1:n_trial){
+    trial_tibble <- get_trial_functional_data(session_id,trial_id)
+    trial_list[[trial_id]] <- trial_tibble
+  }
+  test_tibble <- as_tibble(do.call(rbind, trial_list))
+  test_tibble <- test_tibble %>% add_column("mouse_name" = test[[session_id]]$mouse_name) %>% add_column("date_exp" = test[[session_id]]$date_exp) %>% add_column("session_id" = session_id) 
+  test_tibble
+}
+
+test_list = list()
+for (session_id in 1:2){
+  test_list[[session_id]] <- get_test_functional_data(session_id)
+}
+test_full_functional_tibble <- as_tibble(do.call(rbind, test_list))
+test_full_functional_tibble$session_id <- as.factor(test_full_functional_tibble$session_id )
+test_full_functional_tibble$contrast_diff <- abs(test_full_functional_tibble$contrast_left-test_full_functional_tibble$contrast_right)
+
+test_full_functional_tibble$success <- test_full_functional_tibble$feedback_type == 1
+test_full_functional_tibble$success <- as.numeric(test_full_functional_tibble$success)
+```
+## Overall performance on test sets
+```{r, echo = FALSE}
+test_predictive_feature <- c("session_id","trial_id","contrast_right","contrast_left", "contrast_diff" ,bin_name)
+
+test_predictive_data <- test_full_functional_tibble[test_predictive_feature]
+# test_predictive_data$success <- as.numeric(test_predictive_data$success)
+test_predictive_data$trial_id <- as.numeric(test_predictive_data$trial_id)
+label <- as.numeric(test_full_functional_tibble$success)
+test_data_X <- model.matrix(~., test_predictive_data)
+
+# Convert any integer columns to numeric
+test_predictive_data <- lapply(test_predictive_data, as.numeric)
+
+# Convert to dataframe
+test_predictive_df <- as.data.frame(test_predictive_data)
+
+# reorder columns
+train_columns <- colnames(train_X)
+test_columns <- colnames(test_predictive_df)
+missing_columns <- setdiff(train_columns, test_columns)
+
+# add missing columns to test_predictive_df with appropriate values
+for (col_name in missing_columns) {
+  test_predictive_df[[col_name]] <- NA  # Fill missing columns with NA or other appropriate values
+}
+
+# Reorder columns in test_predictive_df to match train_X
+test_predictive_df <- test_predictive_df[, train_columns, drop = FALSE]
+
+# Convert test_predictive_df to a matrix
+test_data_matrix <- as.matrix(test_predictive_df)
+
+# Convert to xgb.DMatrix
+test_data_X <- xgb.DMatrix(data = test_data_matrix)
+
+
+# Evaluate the performance of the model on the test data
+test_data_predictions <- predict(xgb_model, newdata = test_data_X)
+test_predicted_labels <- as.numeric(ifelse(test_data_predictions > 0.5, 1, 0))
+test_accuracy <- mean(test_predicted_labels == test_label)
+test_accuracy
+```
+
+## Session 1 Performance
+```{r, test session 1, echo = FALSE}
+# session 1
+session_1_test_data <- test_full_functional_tibble[test_full_functional_tibble$session_id == 1, ]
+
+# Extract features for prediction
+test_predictive_feature <- c("session_id","trial_id","contrast_right","contrast_left", "contrast_diff" ,bin_name)
+test_predictive_data <- session_1_test_data[test_predictive_feature]
+
+# Convert any integer columns to numeric
+test_predictive_data <- lapply(test_predictive_data, as.numeric)
+
+# Convert to dataframe
+test_predictive_df <- as.data.frame(test_predictive_data)
+
+# Reorder columns to match train_X
+train_columns <- colnames(train_X)
+test_columns <- colnames(test_predictive_df)
+missing_columns <- setdiff(train_columns, test_columns)
+
+# Add missing columns to test_predictive_df with appropriate values
+for (col_name in missing_columns) {
+  test_predictive_df[[col_name]] <- NA  # Fill missing columns with NA or other appropriate values
+}
+
+# Reorder columns in test_predictive_df to match train_X
+test_predictive_df <- test_predictive_df[, train_columns, drop = FALSE]
+
+# Convert test_predictive_df to a matrix
+test_data_matrix <- as.matrix(test_predictive_df)
+
+# Convert to xgb.DMatrix
+test_data_X <- xgb.DMatrix(data = test_data_matrix)
+
+# Predict using the original xgb_model
+test_predictions <- predict(xgb_model, newdata = test_data_X)
+test_predicted_labels <- as.numeric(ifelse(test_predictions > 0.5, 1, 0))
+
+# Compute accuracy
+test_accuracy <- mean(test_predicted_labels == session_1_test_data$success)
+test_accuracy
+```
+
+## Session 18 Performance
+```{r, test session 18, echo = FALSE}
+# session 18
+session_18_test_data <- test_full_functional_tibble[test_full_functional_tibble$session_id == 18, ]
+
+# Extract features for prediction
+test_predictive_feature <- c("session_id", "trial_id", "contrast_right", "contrast_left", "contrast_diff", bin_name)
+test_predictive_data <- session_18_test_data[test_predictive_feature]
+
+# Convert non-numeric columns to numeric
+for (col in names(test_predictive_data)) {
+  if (!is.numeric(test_predictive_data[[col]])) {
+    test_predictive_data[[col]] <- as.numeric(as.character(test_predictive_data[[col]]))
+  }
+}
+
+# Convert to dataframe
+test_predictive_df <- as.data.frame(test_predictive_data)
+
+# Convert test_predictive_df to a matrix
+test_data_matrix <- as.matrix(test_predictive_df)
+test_data_x <- test_data_matrix
+# Convert to xgb.DMatrix
+# test_data_X <- xgb.DMatrix(data = test_data_matrix)
+
+# Predict using the original xgb_model
+test_predictions <- predict(xgb_model, newdata = test_data_X)
+test_predicted_labels <- as.numeric(ifelse(test_predictions > 0.5, 1, 0))
+
+# Compute accuracy
+test_accuracy <- mean(test_predicted_labels == session_1_test_data$success)
+test_accuracy
+
+```
+
+# (6) Discussion
+
+From the training on the sessions data, looking at the test data which examines session 1 and session 18, the overall accuracy rate is 0.625. The accuracy rate for session 1 is 0.69 and the same for 0.69. When looking at the accuracy rate for sessions 1 and 18 using original data, the model's performance for session 18 is 0.80 and 0.66 for session 1. The overall accuracy is 0.73. Such, the predictive model's accuracy reduces when examining only the test data.
+
+# Reference {-}
+
+ChatGPT, OpenAI. Conversation history: https://chat.openai.com/share/9d85e147-8dea-4f49-8759-63fb1d5b6611
+
+GitHub repository link: https://github.com/aelxia/STA141A.git
+
+Steinmetz, N. A., Zatka-Haas, P., Carandini, M., & Harris, K. D. Distributed coding of choice, action and engagement across the mouse brain. <em>Nature</em> <strong>576</strong>, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
